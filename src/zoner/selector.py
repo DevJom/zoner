@@ -9,6 +9,23 @@ import cv2
 import numpy as np
 import json
 import os
+import sys
+import platform
+
+# Check if the OS is Windows to enable custom OS grab cursors
+IS_WINDOWS = platform.system() == "Windows"
+if IS_WINDOWS:
+    import ctypes
+    # Standard Windows Cursor IDs
+    IDC_ARROW = 32512
+    IDC_HAND = 32649  # Pointing hand cursor
+    IDC_SIZEALL = 32646  # Grab/move cursor (4-directional arrow)
+    try:
+        h_arrow = ctypes.windll.user32.LoadCursorW(0, IDC_ARROW)
+        h_hand = ctypes.windll.user32.LoadCursorW(0, IDC_HAND)
+        h_grab = ctypes.windll.user32.LoadCursorW(0, IDC_SIZEALL)
+    except Exception:
+        IS_WINDOWS = False
 
 class ZoneSelector:
     def __init__(self, source, window_name="Zoner - Select Region", max_width=1280, max_height=720):
@@ -51,6 +68,7 @@ class ZoneSelector:
         self.mouse_pos = (0, 0)      # Mouse position in original coordinates
         
         self.snap_dist = 12          # Snap radius in display pixels
+        self.line_click_thresh = 8.0  # Click threshold to insert point on a line (display pixels)
         self.history = []            # Undo history for current drawing
         
         # Load existing JSON config if it exists
@@ -129,6 +147,29 @@ class ZoneSelector:
         self.current_points = []
         self.history = []
 
+    def _get_segment_dist(self, a, b, click_pt):
+        """
+        Calculates the distance from a click point to a line segment a-b in display coordinates.
+        Returns (distance, projection_factor_t)
+        """
+        a_arr = np.array(a, dtype=np.float32)
+        b_arr = np.array(b, dtype=np.float32)
+        c_arr = np.array(click_pt, dtype=np.float32)
+        
+        ab = b_arr - a_arr
+        ac = c_arr - a_arr
+        
+        ab_len_sq = np.sum(ab**2)
+        if ab_len_sq == 0:
+            return np.linalg.norm(c_arr - a_arr), 0.0
+            
+        t = np.dot(ac, ab) / ab_len_sq
+        t = max(0.0, min(1.0, t))
+        
+        closest = a_arr + t * ab
+        dist = np.linalg.norm(c_arr - closest)
+        return dist, t
+
     def draw(self):
         cv2.namedWindow(self.window_name)
         
@@ -145,17 +186,19 @@ class ZoneSelector:
             x_bounded = max(0, min(x_orig, self.orig_w - 1))
             y_bounded = max(0, min(y_orig, self.orig_h - 1))
 
-            # Helper to check distance in current window display pixels
+            # Helper to check distance from original coordinates to window cursor (x, y)
             def get_dist(p1):
                 x_win = (p1[0] - x_min_orig) * self.scale * self.zoom_factor
                 y_win = (p1[1] - y_min_orig) * self.scale * self.zoom_factor
                 return np.hypot(x_win - x, y_win - y)
 
             if event == cv2.EVENT_LBUTTONDOWN:
+                # 1. Snap-close if clicking on the first point of the current zone
                 if len(self.current_points) >= 3 and get_dist(self.current_points[0]) < self.snap_dist:
                     self._finish_current_zone()
                     return
 
+                # 2. Check if clicking on active drawing points to drag
                 for idx, pt in enumerate(self.current_points):
                     if get_dist(pt) < self.snap_dist:
                         self.selected_zone_idx = -2
@@ -163,6 +206,7 @@ class ZoneSelector:
                         self.dragging = True
                         return
                 
+                # 3. Check if clicking on saved zones points to drag
                 for z_idx, zone in enumerate(self.zones):
                     for p_idx, pt in enumerate(zone["points"]):
                         if get_dist(pt) < self.snap_dist:
@@ -171,11 +215,76 @@ class ZoneSelector:
                             self.dragging = True
                             return
                 
+                # 4. Check if clicking on a line segment to insert a point
+                # Check active drawing segments
+                if len(self.current_points) >= 2:
+                    # Check lines between sequential points
+                    for i in range(len(self.current_points) - 1):
+                        p1_disp = ((self.current_points[i][0] - x_min_orig) * self.scale * self.zoom_factor, 
+                                   (self.current_points[i][1] - y_min_orig) * self.scale * self.zoom_factor)
+                        p2_disp = ((self.current_points[i+1][0] - x_min_orig) * self.scale * self.zoom_factor, 
+                                   (self.current_points[i+1][1] - y_min_orig) * self.scale * self.zoom_factor)
+                        dist, t = self._get_segment_dist(p1_disp, p2_disp, (x, y))
+                        if dist < self.line_click_thresh and 0.05 < t < 0.95:
+                            self.history.append(list(self.current_points))
+                            self.current_points.insert(i + 1, (x_bounded, y_bounded))
+                            print(f"[EVENT] Inserted point at segment index {i+1} on active drawing.")
+                            return
+                    # Check loop preview line (last to first) if drawing is closed preview
+                    if len(self.current_points) >= 3:
+                        p1_disp = ((self.current_points[-1][0] - x_min_orig) * self.scale * self.zoom_factor, 
+                                   (self.current_points[-1][1] - y_min_orig) * self.scale * self.zoom_factor)
+                        p2_disp = ((self.current_points[0][0] - x_min_orig) * self.scale * self.zoom_factor, 
+                                   (self.current_points[0][1] - y_min_orig) * self.scale * self.zoom_factor)
+                        dist, t = self._get_segment_dist(p1_disp, p2_disp, (x, y))
+                        if dist < self.line_click_thresh and 0.05 < t < 0.95:
+                            self.history.append(list(self.current_points))
+                            self.current_points.append((x_bounded, y_bounded))
+                            print(f"[EVENT] Inserted point at segment loop-end on active drawing.")
+                            return
+
+                # Check saved zones segments
+                for z_idx, zone in enumerate(self.zones):
+                    for i in range(len(zone["points"])):
+                        j = (i + 1) % len(zone["points"])
+                        p1_disp = ((zone["points"][i][0] - x_min_orig) * self.scale * self.zoom_factor, 
+                                   (zone["points"][i][1] - y_min_orig) * self.scale * self.zoom_factor)
+                        p2_disp = ((zone["points"][j][0] - x_min_orig) * self.scale * self.zoom_factor, 
+                                   (zone["points"][j][1] - y_min_orig) * self.scale * self.zoom_factor)
+                        dist, t = self._get_segment_dist(p1_disp, p2_disp, (x, y))
+                        if dist < self.line_click_thresh and 0.05 < t < 0.95:
+                            zone["points"].insert(i + 1, (x_bounded, y_bounded))
+                            print(f"[EVENT] Inserted point at segment index {i+1} on zone '{zone['name']}'.")
+                            return
+
+                # 5. Otherwise, add a new point to the end of active drawing
                 self.history.append(list(self.current_points))
                 self.current_points.append((x_bounded, y_bounded))
                 
             elif event == cv2.EVENT_MOUSEMOVE:
                 self.mouse_pos = (x_bounded, y_bounded)
+                
+                # Dynamic Windows Cursor Control (Arrow/Hand/Grab)
+                if IS_WINDOWS:
+                    hovering_point = False
+                    for pt in self.current_points:
+                        if get_dist(pt) < self.snap_dist:
+                            hovering_point = True
+                            break
+                    if not hovering_point:
+                        for zone in self.zones:
+                            for pt in zone["points"]:
+                                if get_dist(pt) < self.snap_dist:
+                                    hovering_point = True
+                                    break
+                    
+                    if self.dragging:
+                        ctypes.windll.user32.SetCursor(h_grab)
+                    elif hovering_point:
+                        ctypes.windll.user32.SetCursor(h_hand)
+                    else:
+                        ctypes.windll.user32.SetCursor(h_arrow)
+
                 if self.dragging:
                     if self.selected_zone_idx == -2:
                         self.current_points[self.selected_point_idx] = (x_bounded, y_bounded)
@@ -188,6 +297,7 @@ class ZoneSelector:
                 self.selected_point_idx = -1
 
             elif event == cv2.EVENT_RBUTTONDOWN:
+                # Right-click deletes hovered points
                 for idx, pt in enumerate(self.current_points):
                     if get_dist(pt) < self.snap_dist:
                         self.history.append(list(self.current_points))
@@ -203,14 +313,12 @@ class ZoneSelector:
                             return
                             
             elif event == cv2.EVENT_MOUSEWHEEL:
-                # Zoom center coordinates on original frame before zooming
                 mx_orig = x_min_orig + x / (self.scale * self.zoom_factor)
                 my_orig = y_min_orig + y / (self.scale * self.zoom_factor)
                 
-                # Check scroll direction
-                if flags > 0:  # Scroll forward
+                if flags > 0:
                     self.zoom_factor = min(self.zoom_factor + 0.2, 8.0)
-                else:          # Scroll backward
+                else:
                     self.zoom_factor = max(self.zoom_factor - 0.2, 1.0)
                     
                 if self.zoom_factor > 1.0:
@@ -239,6 +347,12 @@ class ZoneSelector:
                 y_win = int((pt[1] - y_min_orig) * self.scale * self.zoom_factor)
                 return (x_win, y_win)
 
+            # Check distance in window space for mouse hovering
+            def is_hovered(pt):
+                pt_win = to_win(pt)
+                mx_win, my_win = to_win(self.mouse_pos)
+                return np.hypot(pt_win[0] - mx_win, pt_win[1] - my_win) < self.snap_dist
+
             # Draw Saved Zones
             for z_idx, zone in enumerate(self.zones):
                 pts_disp = np.array([to_win(pt) for pt in zone["points"]], dtype=np.int32)
@@ -248,8 +362,15 @@ class ZoneSelector:
                 cv2.addWeighted(overlay, 0.2, display_frame, 0.8, 0, display_frame)
                 
                 cv2.polylines(display_frame, [pts_disp], isClosed=True, color=(0, 200, 0), thickness=2)
-                for pt in pts_disp:
-                    cv2.circle(display_frame, tuple(pt), 4, (0, 255, 0), -1)
+                
+                for pt_orig in zone["points"]:
+                    pt_disp = to_win(pt_orig)
+                    if is_hovered(pt_orig):
+                        # Highlight grab-able point on hover: larger and distinct color (orange)
+                        cv2.circle(display_frame, pt_disp, 7, (0, 165, 255), -1)
+                        cv2.circle(display_frame, pt_disp, 8, (255, 255, 255), 1)
+                    else:
+                        cv2.circle(display_frame, pt_disp, 4, (0, 255, 0), -1)
                 
                 centroid = np.mean(pts_disp, axis=0).astype(int)
                 cv2.putText(display_frame, zone["name"], (centroid[0] - 30, centroid[1]), 
@@ -264,9 +385,15 @@ class ZoneSelector:
                 if len(self.current_points) >= 3:
                     cv2.line(display_frame, tuple(pts_disp[-1]), tuple(pts_disp[0]), (0, 255, 255), 1, cv2.LINE_AA)
                     
-                for idx, pt in enumerate(pts_disp):
-                    cv2.circle(display_frame, tuple(pt), 5, (0, 215, 255), -1)
-                    cv2.putText(display_frame, str(idx + 1), (pt[0] + 8, pt[1] - 8), 
+                for idx, pt_orig in enumerate(self.current_points):
+                    pt_disp = to_win(pt_orig)
+                    if is_hovered(pt_orig):
+                        # Highlight active point on hover
+                        cv2.circle(display_frame, pt_disp, 8, (0, 165, 255), -1)
+                        cv2.circle(display_frame, pt_disp, 9, (255, 255, 255), 1)
+                    else:
+                        cv2.circle(display_frame, pt_disp, 5, (0, 215, 255), -1)
+                    cv2.putText(display_frame, str(idx + 1), (pt_disp[0] + 8, pt_disp[1] - 8), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 215, 255), 1)
 
             # Draw cursor coordinate display next to mouse pointer
@@ -282,7 +409,7 @@ class ZoneSelector:
             cv2.rectangle(overlay, (0, self.display_h - hud_height), (self.display_w, self.display_h), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.7, display_frame, 0.3, 0, display_frame)
             
-            cv2.putText(display_frame, "Controls: L-Click: Add/Drag | R-Click: Delete Point | Z: Undo | R: Reset All", 
+            cv2.putText(display_frame, "Controls: L-Click: Add/Drag (Click Line to Insert) | R-Click: Delete Point | Z: Undo", 
                         (10, self.display_h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
             cv2.putText(display_frame, "          ENTER: Save Zone / Exit | S: Export JSON | L: Load JSON | Scroll: Zoom", 
                         (10, self.display_h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
