@@ -104,3 +104,26 @@ You can test the module instantly from the command line:
 python -m zoner.selector
 ```
 *(This starts a test session on the default `PETS2009.avi` video).*
+
+---
+
+## Why `pyzoner`? (Comparison)
+
+| Feature | `roipoly` | `cv2.selectROI` | `labelme` | **`pyzoner`** |
+|---|:---:|:---:|:---:|:---:|
+| Polygon drawing | ✅ | ❌ | ✅ | ✅ |
+| Drag to edit points | ❌ | ❌ | ✅ | ✅ |
+| Insert point on line click | ❌ | ❌ | ❌ | ✅ |
+| Scroll-wheel zoom | ❌ | ❌ | ✅ | ✅ |
+| Undo (Ctrl+Z) | ❌ | ❌ | ✅ | ✅ |
+| Grab cursor on hover | ❌ | ❌ | ❌ | ✅ |
+| Hover highlight feedback | ❌ | ❌ | ❌ | ✅ |
+| JSON save / load | ❌ | ❌ | ✅ | ✅ |
+| Video frame support | ❌ | ❌ | ❌ | ✅ |
+| Multiple named zones | ❌ | ❌ | ✅ | ✅ |
+| Returns NumPy arrays | ✅ | ✅ | ❌ | ✅ |
+| Lightweight (3 lines of code) | ✅ | ✅ | ❌ | ✅ |
+| **Install size** | ~50 KB | built-in | ~50 MB+ | **~15 KB** |
+
+> **`pyzoner`** fills the sweet spot between *"too simple"* (`selectROI`) and *"too heavy"* (`labelme`).  
+> It's the lightest full-featured interactive zone selector for computer vision pipelines.
